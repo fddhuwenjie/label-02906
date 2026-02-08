@@ -20,6 +20,9 @@ build/
 *.csv
 output/
 
+# 缓存文件
+.gitlab-stats-cache.json
+
 # IDE
 .idea/
 .vscode/

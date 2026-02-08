@@ -26,8 +26,13 @@ WORKDIR /app
 # 从 builder 阶段复制依赖
 COPY --from=builder /app/deps /app/deps
 
-# 复制应用代码
+# 复制所有应用代码模块
 COPY gitlab_stats.py .
+COPY gitlab_client.py .
+COPY stats_collector.py .
+COPY exporter.py .
+COPY models.py .
+COPY config.py .
 
 # 切换到非 root 用户
 USER appuser
