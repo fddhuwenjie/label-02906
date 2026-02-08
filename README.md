@@ -105,6 +105,9 @@ python gitlab_stats.py --url https://gitlab.example.com --token glpat-xxx --incr
 | `--incremental, -i` | 否 | 增量统计模式，只获取上次之后的新提交 |
 | `--clear-cache` | 否 | 清除缓存后重新全量统计 |
 | `--cache-dir` | 否 | 缓存文件目录，默认当前目录 |
+| `--group` | 否 | 按 group 路径过滤项目 (如: mygroup 或 mygroup/subgroup) |
+| `--namespace` | 否 | 按 namespace 过滤项目 (支持正则表达式) |
+| `--project-pattern` | 否 | 按项目名称过滤 (支持正则表达式) |
 | `-v, --verbose` | 否 | 显示详细日志 |
 
 *可通过配置文件或环境变量 (GITLAB_URL, GITLAB_TOKEN) 提供

@@ -33,6 +33,15 @@ def parse_date(date_str: str) -> str:
         raise argparse.ArgumentTypeError(f"日期格式错误: {date_str}，请使用 YYYY-MM-DD 格式")
 
 
+def validate_date_range(since: str, until: str) -> None:
+    """校验日期范围合理性"""
+    if since and until:
+        since_dt = datetime.fromisoformat(since)
+        until_dt = datetime.fromisoformat(until)
+        if since_dt > until_dt:
+            raise ValueError(f"日期范围无效: since ({since[:10]}) 不能晚于 until ({until[:10]})")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="GitLab 代码统计脚本 - 统计项目提交人员的代码量，过滤 merge commits",
@@ -57,8 +66,14 @@ def main():
   # 增量统计（只获取上次之后的新提交）
   %(prog)s --url https://gitlab.example.com --token glpat-xxx --incremental
 
-  # 清除缓存重新统计
+  # 清除缓存重新全量统计
   %(prog)s --url https://gitlab.example.com --token glpat-xxx --clear-cache
+
+  # 按 group 过滤项目
+  %(prog)s --url https://gitlab.example.com --token glpat-xxx --group myteam/backend
+
+  # 按 namespace 和项目名称过滤
+  %(prog)s --url https://gitlab.example.com --token glpat-xxx --namespace "team-a" --project-pattern "api"
 
 配置文件格式 (JSON):
   {
@@ -92,6 +107,9 @@ def main():
                         help='清除缓存文件后重新统计')
     parser.add_argument('--cache-dir', help='缓存文件目录 (默认当前目录)')
     parser.add_argument('--verbose', '-v', action='store_true', help='显示详细日志')
+    parser.add_argument('--group', help='按 group 路径过滤项目 (如: mygroup 或 mygroup/subgroup)')
+    parser.add_argument('--namespace', help='按 namespace 过滤项目 (支持正则表达式)')
+    parser.add_argument('--project-pattern', help='按项目名称过滤 (支持正则表达式)')
     
     args = parser.parse_args()
     
@@ -114,6 +132,13 @@ def main():
         logger.error("缺少 GitLab Token，请通过 --token 参数、配置文件或 GITLAB_TOKEN 环境变量提供")
         sys.exit(1)
     
+    # 校验日期范围
+    try:
+        validate_date_range(args.since, args.until)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    
     # 清除缓存
     cache_path = Path(args.cache_dir or ".") / CodeStatsCollector.CACHE_FILE
     if args.clear_cache and cache_path.exists():
@@ -125,7 +150,10 @@ def main():
             url, 
             token, 
             timeout=timeout,
-            all_projects=all_projects
+            all_projects=all_projects,
+            group=args.group,
+            namespace_pattern=args.namespace,
+            project_pattern=args.project_pattern
         )
         collector = CodeStatsCollector(
             client,
