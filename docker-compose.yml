@@ -1,0 +1,16 @@
+services:
+  gitlab-stats:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: gitlab-stats
+    environment:
+      - GITLAB_URL=${GITLAB_URL:-https://gitlab.example.com}
+      - GITLAB_TOKEN=${GITLAB_TOKEN:-your-token-here}
+    volumes:
+      - ./output:/app/output
+    # CLI 工具，使用 stdin_open 和 tty 保持容器可交互
+    stdin_open: true
+    tty: true
+    # 默认显示帮助信息
+    command: ["--help"]
