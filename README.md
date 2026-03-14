@@ -22,6 +22,67 @@ docker compose run --rm gitlab-stats --url $GITLAB_URL --token $GITLAB_TOKEN
 docker compose run --rm gitlab-stats --url https://gitlab.example.com --token glpat-xxx -o /app/output/stats.csv
 ```
 
+### 离线验证（Mock GitLab）
+
+项目内置了一个 Mock GitLab API 服务，无需真实 GitLab 即可完整验证所有功能。
+
+Mock 数据模拟了一个 "smart-home" 团队，包含 4 个项目、14 条提交（覆盖 merge、revert、cherry-pick、squash 等类型）、4 位开发者。
+
+```bash
+# 一键验证（构建 + 启动 mock + 运行全部测试）
+./verify.sh
+```
+
+也可以手动逐步操作：
+
+```bash
+# 1. 构建并启动 mock 服务
+docker compose build
+docker compose up -d mock-gitlab
+
+# 2. 全量统计（默认连接 mock 服务）
+docker compose run --rm gitlab-stats \
+  --url http://mock-gitlab:8080 --token glpat-mock-token-for-testing
+
+# 3. 导出 CSV
+docker compose run --rm gitlab-stats \
+  --url http://mock-gitlab:8080 --token glpat-mock-token-for-testing \
+  -o /app/output/stats.csv
+
+# 4. 按 namespace 过滤（只统计 backend 项目）
+docker compose run --rm gitlab-stats \
+  --url http://mock-gitlab:8080 --token glpat-mock-token-for-testing \
+  --namespace "backend"
+
+# 5. 按日期范围过滤
+docker compose run --rm gitlab-stats \
+  --url http://mock-gitlab:8080 --token glpat-mock-token-for-testing \
+  --since 2025-03-05 --until 2025-03-12
+
+# 6. 增量模式
+docker compose run --rm gitlab-stats \
+  --url http://mock-gitlab:8080 --token glpat-mock-token-for-testing \
+  --incremental --cache-dir /app/output
+
+# 7. 运行单元测试（58 个测试）
+docker run --rm -v "$(pwd)/backend:/app" -w /app python:3.11-slim \
+  sh -c "pip install -q pytest requests urllib3 && python -m pytest tests/ -v"
+
+# 8. 清理
+docker compose down
+```
+
+Mock 数据预期结果（全量统计）：
+
+| 作者 | 有效提交 | 新增 | 删除 | 参与项目 |
+|------|----------|------|------|----------|
+| 张三 | 3 | 1220 | 395 | home-gateway, device-firmware |
+| 王五 | 2 | 510 | 80 | mobile-app, docs |
+| 李四 | 3 | 250 | 80 | home-gateway, device-firmware |
+| 赵六 | 2 | 275 | 50 | mobile-app, docs |
+
+被过滤的提交：1 个 merge commit、1 个 revert、1 个 cherry-pick、1 个 squash merge。
+
 ### 本地启动
 
 ```bash
@@ -52,6 +113,7 @@ python gitlab_stats.py --url https://gitlab.example.com --token glpat-xxx --incr
 | 服务 | 说明 | 端口 |
 |------|------|------|
 | gitlab-stats | GitLab 代码统计 CLI 工具 | N/A (CLI) |
+| mock-gitlab | 离线 Mock GitLab API 服务 | 8906 (宿主机) → 8080 (容器) |
 
 ## 测试账号
 
