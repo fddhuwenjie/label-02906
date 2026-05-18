@@ -333,7 +333,8 @@ class MockGitLabHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    port = 8080
+    import sys
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     server = HTTPServer(("0.0.0.0", port), MockGitLabHandler)
     print(f"[MockGitLab] Mock GitLab API 服务启动在 http://0.0.0.0:{port}")
     print(f"[MockGitLab] Token: {VALID_TOKEN}")
