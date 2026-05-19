@@ -1,11 +1,12 @@
 """集成测试：端到端流程测试"""
 
+import csv
+import json
 import pytest
 import sys
 import os
-import json
 import tempfile
-from unittest.mock import Mock, patch, MagicMock
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,233 +15,337 @@ from gitlab_client import GitLabClient
 from stats_collector import CodeStatsCollector
 from exporter import StatsExporter
 
+MOCK_GITLAB_URL = os.environ.get("GITLAB_URL", "http://mock-gitlab:8080")
+MOCK_GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "glpat-mock-token-for-testing")
 
-class TestEndToEndFlow:
-    """端到端流程测试"""
-    
-    @pytest.fixture
-    def mock_gitlab_responses(self):
-        """模拟 GitLab API 响应"""
-        return {
-            "projects": [
-                {"id": 1, "name": "project-a", "namespace": {"full_path": "team/backend"}},
-                {"id": 2, "name": "project-b", "namespace": {"full_path": "team/frontend"}},
-            ],
-            "commits_project_1": [
-                {
-                    "id": "abc123",
-                    "parent_ids": ["def456"],
-                    "title": "feat: add feature",
-                    "message": "feat: add feature",
-                    "author_name": "Alice",
-                    "author_email": "alice@example.com",
-                    "stats": {"additions": 100, "deletions": 20}
-                },
-                {
-                    "id": "merge123",
-                    "parent_ids": ["abc123", "xyz789"],  # merge commit
-                    "title": "Merge branch 'feature'",
-                    "message": "Merge branch 'feature'",
-                    "author_name": "Alice",
-                    "author_email": "alice@example.com",
-                    "stats": {"additions": 200, "deletions": 50}
-                },
-            ],
-            "commits_project_2": [
-                {
-                    "id": "xyz789",
-                    "parent_ids": ["uvw123"],
-                    "title": "fix: bug fix",
-                    "message": "fix: bug fix",
-                    "author_name": "Bob",
-                    "author_email": "bob@example.com",
-                    "stats": {"additions": 50, "deletions": 10}
-                },
-            ]
-        }
-    
-    @pytest.fixture
-    def mock_client(self, mock_gitlab_responses):
-        """创建模拟的 GitLabClient"""
-        with patch.object(GitLabClient, '_create_session'):
-            client = GitLabClient("https://gitlab.example.com", "test-token")
-            client.session = Mock()
-            client.rate_limiter = Mock()
-            client.rate_limiter.wait = Mock()
-            client.rate_limiter.on_success = Mock()
-            
-            def mock_get_projects():
-                return mock_gitlab_responses["projects"]
-            
-            def mock_get_commits(project_id, project_name, **kwargs):
-                if project_id == 1:
-                    return mock_gitlab_responses["commits_project_1"]
-                elif project_id == 2:
-                    return mock_gitlab_responses["commits_project_2"]
-                return []
-            
-            client.get_projects = mock_get_projects
-            client.get_commits = mock_get_commits
-            return client
-    
-    def test_full_collection_flow(self, mock_client):
-        """完整的统计收集流程"""
-        collector = CodeStatsCollector(mock_client)
-        stats = collector.collect()
-        
-        # 应该有两个作者
-        assert len(stats) == 2
-        
-        # Alice 的统计（merge commit 应被过滤）
-        alice_stats = stats.get("alice@example.com")
-        assert alice_stats is not None
-        assert alice_stats.additions == 100  # 只有非 merge commit
-        assert alice_stats.deletions == 20
-        assert alice_stats.total_commits == 1
-        
-        # Bob 的统计
-        bob_stats = stats.get("bob@example.com")
-        assert bob_stats is not None
-        assert bob_stats.additions == 50
-        assert bob_stats.deletions == 10
-        assert bob_stats.total_commits == 1
-    
-    def test_csv_export(self, mock_client):
-        """CSV 导出测试"""
-        collector = CodeStatsCollector(mock_client)
-        stats = collector.collect()
-        
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
-            csv_path = f.name
-        
+
+def _wait_for_service(url, token, timeout=30):
+    import requests as req
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            StatsExporter.to_csv(stats, csv_path)
-            
-            # 验证文件存在且有内容
-            assert Path(csv_path).exists()
-            content = Path(csv_path).read_text(encoding='utf-8')
-            assert "Alice" in content or "alice" in content
-            assert "Bob" in content or "bob" in content
-        finally:
-            Path(csv_path).unlink(missing_ok=True)
-
-
-class TestIncrementalCollection:
-    """增量收集测试"""
-    
-    def test_incremental_mode_saves_cache(self):
-        """增量模式应保存缓存"""
-        with patch.object(GitLabClient, '_create_session'):
-            client = GitLabClient("https://gitlab.example.com", "test-token")
-            client.rate_limiter = Mock()
-            client.rate_limiter.wait = Mock()
-            client.rate_limiter.on_success = Mock()
-            
-            # Mock API 响应
-            client.get_projects = Mock(return_value=[
-                {"id": 1, "name": "test-project"}
-            ])
-            client.get_commits = Mock(return_value=[
-                {
-                    "id": "commit123",
-                    "parent_ids": ["parent456"],
-                    "title": "test commit",
-                    "author_name": "Test",
-                    "author_email": "test@example.com",
-                    "stats": {"additions": 10, "deletions": 5}
-                }
-            ])
-            
-            with tempfile.TemporaryDirectory() as tmpdir:
-                collector = CodeStatsCollector(
-                    client, 
-                    incremental=True, 
-                    cache_dir=tmpdir
-                )
-                collector.collect()
-                
-                # 验证缓存文件已创建
-                cache_path = Path(tmpdir) / CodeStatsCollector.CACHE_FILE
-                assert cache_path.exists()
-                
-                # 验证缓存内容
-                cache_data = json.loads(cache_path.read_text())
-                assert "projects_cursor" in cache_data
-                assert "1" in cache_data["projects_cursor"]
-                assert cache_data["projects_cursor"]["1"] == "commit123"
-    
-    def test_incremental_mode_loads_cache(self):
-        """增量模式应加载缓存"""
-        with patch.object(GitLabClient, '_create_session'):
-            client = GitLabClient("https://gitlab.example.com", "test-token")
-            client.rate_limiter = Mock()
-            
-            with tempfile.TemporaryDirectory() as tmpdir:
-                # 预先创建缓存文件
-                cache_path = Path(tmpdir) / CodeStatsCollector.CACHE_FILE
-                cache_data = {
-                    "version": "1.0",
-                    "last_updated": "2025-01-01T00:00:00",
-                    "projects_cursor": {"1": "old_commit_sha"},
-                    "author_stats": {
-                        "test@example.com": {
-                            "author_name": "Test",
-                            "author_email": "test@example.com",
-                            "additions": 100,
-                            "deletions": 50,
-                            "total_commits": 5,
-                            "projects": ["old-project"]
-                        }
-                    }
-                }
-                cache_path.write_text(json.dumps(cache_data))
-                
-                collector = CodeStatsCollector(
-                    client, 
-                    incremental=True, 
-                    cache_dir=tmpdir
-                )
-                
-                # 验证缓存已加载
-                assert "test@example.com" in collector.author_stats
-                assert collector.author_stats["test@example.com"].additions == 100
-                assert collector.cache.projects_cursor.get("1") == "old_commit_sha"
-
-
-class TestFilteringIntegration:
-    """过滤功能集成测试"""
-    
-    def test_group_filtering(self):
-        """Group 过滤集成测试"""
-        with patch.object(GitLabClient, '_create_session'):
-            client = GitLabClient(
-                "https://gitlab.example.com", 
-                "test-token",
-                group="team-a"
+            resp = req.get(
+                f"{url}/api/v4/projects",
+                headers={"PRIVATE-TOKEN": token},
+                timeout=3,
             )
-            assert client.group == "team-a"
-    
-    def test_namespace_and_project_filtering(self):
-        """Namespace 和项目名称过滤集成测试"""
-        with patch.object(GitLabClient, '_create_session'):
-            client = GitLabClient(
-                "https://gitlab.example.com", 
-                "test-token",
-                namespace_pattern=r"backend",
-                project_pattern=r"api"
+            if resp.status_code == 200:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+@pytest.fixture(scope="module")
+def mock_gitlab_server():
+    """等待 Docker 网络中的 mock-gitlab 服务就绪"""
+    if not _wait_for_service(MOCK_GITLAB_URL, MOCK_GITLAB_TOKEN):
+        pytest.skip("mock-gitlab 服务不可用，请先运行 docker compose up")
+    yield MOCK_GITLAB_URL
+
+
+@pytest.fixture
+def gitlab_client(mock_gitlab_server):
+    """创建连接到 mock-gitlab 容器的客户端"""
+    return GitLabClient(
+        mock_gitlab_server,
+        MOCK_GITLAB_TOKEN,
+        timeout=15,
+    )
+
+
+@pytest.fixture
+def tmp_dir():
+    """创建临时目录用于缓存和导出"""
+    with tempfile.TemporaryDirectory() as d:
+        yield d
+
+
+@pytest.fixture
+def first_project_info(gitlab_client):
+    """获取第一个项目及其最新 commit 的信息"""
+    projects = gitlab_client.get_projects()
+    assert len(projects) > 0
+    first_project = projects[0]
+    first_project_id = str(first_project["id"])
+    commits = gitlab_client.get_commits(
+        first_project["id"], first_project["name"]
+    )
+    assert len(commits) > 0
+    first_commit_sha = commits[0]["id"]
+    return first_project_id, first_commit_sha
+
+
+class TestFullStatisticsFlow:
+    """完整统计流程测试"""
+
+    def test_should_produce_complete_statistics_when_collecting_all_projects(
+        self, gitlab_client, tmp_dir
+    ):
+        collector = CodeStatsCollector(gitlab_client, cache_dir=tmp_dir)
+        stats = collector.collect()
+
+        assert len(stats) > 0
+
+        expected_authors = {"zhangsan@example.com", "lisi@example.com",
+                            "wangwu@example.com", "zhaoliu@example.com"}
+        actual_emails = set(stats.keys())
+        assert actual_emails == expected_authors
+
+    @pytest.mark.parametrize("author_email,expected_min_additions,expected_min_deletions", [
+        ("zhangsan@example.com", 100, 10),
+        ("lisi@example.com", 10, 10),
+        ("wangwu@example.com", 100, 10),
+        ("zhaoliu@example.com", 10, 10),
+    ])
+    def test_should_aggregate_correct_stats_per_author_when_commits_collected(
+        self, gitlab_client, tmp_dir, author_email, expected_min_additions, expected_min_deletions
+    ):
+        collector = CodeStatsCollector(gitlab_client, cache_dir=tmp_dir)
+        stats = collector.collect()
+
+        assert author_email in stats
+        author = stats[author_email]
+        assert author.additions >= expected_min_additions
+        assert author.deletions >= expected_min_deletions
+
+    def test_should_filter_non_code_commits_when_collecting(
+        self, gitlab_client, tmp_dir
+    ):
+        collector = CodeStatsCollector(gitlab_client, cache_dir=tmp_dir)
+        stats = collector.collect()
+
+        zhangsan = stats.get("zhangsan@example.com")
+        assert zhangsan is not None
+        assert zhangsan.total_commits == 3
+
+        wangwu = stats.get("wangwu@example.com")
+        assert wangwu is not None
+        assert wangwu.total_commits == 2
+
+
+class TestNamespaceFiltering:
+    """--namespace 过滤测试"""
+
+    @pytest.mark.parametrize("namespace_pattern,expected_project_count", [
+        ("backend", 2),
+        ("frontend", 1),
+        ("docs", 1),
+    ])
+    def test_should_filter_projects_by_namespace_when_namespace_pattern_provided(
+        self, mock_gitlab_server, tmp_dir, namespace_pattern, expected_project_count
+    ):
+        client = GitLabClient(
+            mock_gitlab_server,
+            MOCK_GITLAB_TOKEN,
+            timeout=15,
+            namespace_pattern=namespace_pattern,
+        )
+        projects = client.get_projects()
+        assert len(projects) == expected_project_count
+
+        collector = CodeStatsCollector(client, cache_dir=tmp_dir)
+        stats = collector.collect()
+
+        for author in stats.values():
+            for proj in author.projects:
+                if namespace_pattern == "backend":
+                    assert proj in ("home-gateway", "device-firmware")
+                elif namespace_pattern == "frontend":
+                    assert proj == "mobile-app"
+                elif namespace_pattern == "docs":
+                    assert proj == "docs"
+
+    @pytest.mark.parametrize("namespace_pattern,expected_count", [
+        ("nonexistent", 0),
+        ("smart-home", 4),
+    ])
+    def test_should_return_correct_project_count_when_namespace_filter_applied(
+        self, mock_gitlab_server, namespace_pattern, expected_count
+    ):
+        client = GitLabClient(
+            mock_gitlab_server,
+            MOCK_GITLAB_TOKEN,
+            timeout=15,
+            namespace_pattern=namespace_pattern,
+        )
+        projects = client.get_projects()
+        assert len(projects) == expected_count
+
+
+class TestIncrementalMode:
+    """--incremental 增量模式测试"""
+
+    def test_should_save_cache_after_collection_when_incremental_enabled(
+        self, gitlab_client, tmp_dir
+    ):
+        collector = CodeStatsCollector(
+            gitlab_client, incremental=True, cache_dir=tmp_dir
+        )
+        stats = collector.collect()
+
+        cache_path = Path(tmp_dir) / CodeStatsCollector.CACHE_FILE
+        assert cache_path.exists()
+
+        cache_data = json.loads(cache_path.read_text(encoding='utf-8'))
+        assert cache_data["version"] == "1.0"
+        assert "projects_cursor" in cache_data
+        assert len(cache_data["projects_cursor"]) > 0
+
+    def test_should_accumulate_stats_when_running_incremental_twice(
+        self, gitlab_client, tmp_dir
+    ):
+        collector1 = CodeStatsCollector(
+            gitlab_client, incremental=True, cache_dir=tmp_dir
+        )
+        stats1 = collector1.collect()
+        first_additions = {
+            k: v.additions for k, v in stats1.items()
+        }
+
+        collector2 = CodeStatsCollector(
+            gitlab_client, incremental=True, cache_dir=tmp_dir
+        )
+        stats2 = collector2.collect()
+
+        for email, author in stats2.items():
+            assert author.additions >= first_additions.get(email, 0)
+
+    @pytest.mark.parametrize("incremental_flag", [True, False])
+    def test_should_respect_incremental_flag_when_collecting(
+        self, gitlab_client, tmp_dir, incremental_flag
+    ):
+        collector = CodeStatsCollector(
+            gitlab_client, incremental=incremental_flag, cache_dir=tmp_dir
+        )
+        stats = collector.collect()
+
+        cache_path = Path(tmp_dir) / CodeStatsCollector.CACHE_FILE
+        if incremental_flag:
+            assert cache_path.exists()
+        else:
+            assert not cache_path.exists()
+
+    def test_should_use_stop_at_sha_when_cache_has_previous_cursor(
+        self, mock_gitlab_server, first_project_info, tmp_dir
+    ):
+        first_project_id, first_commit_sha = first_project_info
+
+        cache_data = {
+            "version": "1.0",
+            "last_updated": "2025-03-01T00:00:00",
+            "projects_cursor": {first_project_id: first_commit_sha},
+            "author_stats": {
+                "cached@example.com": {
+                    "author_name": "Cached",
+                    "author_email": "cached@example.com",
+                    "additions": 999,
+                    "deletions": 100,
+                    "total_commits": 5,
+                    "projects": ["old-project"],
+                }
+            },
+        }
+        cache_path = Path(tmp_dir) / CodeStatsCollector.CACHE_FILE
+        cache_path.write_text(json.dumps(cache_data))
+
+        client = GitLabClient(mock_gitlab_server, MOCK_GITLAB_TOKEN, timeout=15)
+        collector = CodeStatsCollector(
+            client, incremental=True, cache_dir=tmp_dir
+        )
+        stats = collector.collect()
+
+        assert "cached@example.com" in stats
+        assert stats["cached@example.com"].additions == 999
+
+
+class TestCSVExport:
+    """CSV 导出格式正确性"""
+
+    @pytest.mark.parametrize("sort_key", ["additions", "total_commits"])
+    def test_should_export_valid_csv_when_stats_collected(
+        self, gitlab_client, tmp_dir, sort_key
+    ):
+        collector = CodeStatsCollector(gitlab_client, cache_dir=tmp_dir)
+        stats = collector.collect()
+
+        csv_path = os.path.join(tmp_dir, "stats.csv")
+        StatsExporter.to_csv(stats, csv_path)
+
+        assert Path(csv_path).exists()
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+
+        header = rows[0]
+        assert header == ['作者', '邮箱', '新增行数', '删除行数',
+                          '净增行数', '提交次数', '参与项目数', '参与项目']
+
+        assert len(rows) == len(stats) + 1
+
+    def test_should_include_all_authors_in_csv_when_exported(
+        self, gitlab_client, tmp_dir
+    ):
+        collector = CodeStatsCollector(gitlab_client, cache_dir=tmp_dir)
+        stats = collector.collect()
+
+        csv_path = os.path.join(tmp_dir, "stats.csv")
+        StatsExporter.to_csv(stats, csv_path)
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+
+        csv_emails = {row[1] for row in rows[1:]}
+        stats_emails = set(stats.keys())
+        assert csv_emails == stats_emails
+
+    @pytest.mark.parametrize("field_index,field_name", [
+        (2, "新增行数"),
+        (3, "删除行数"),
+        (4, "净增行数"),
+        (5, "提交次数"),
+        (6, "参与项目数"),
+    ])
+    def test_should_have_numeric_values_in_csv_when_exported(
+        self, gitlab_client, tmp_dir, field_index, field_name
+    ):
+        collector = CodeStatsCollector(gitlab_client, cache_dir=tmp_dir)
+        stats = collector.collect()
+
+        csv_path = os.path.join(tmp_dir, "stats.csv")
+        StatsExporter.to_csv(stats, csv_path)
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+
+        for row in rows[1:]:
+            value = row[field_index]
+            assert value.lstrip('-').isdigit(), (
+                f"{field_name} 列应为整数，实际值: {value}"
             )
-            
-            projects = [
-                {"name": "user-api", "namespace": {"full_path": "team/backend"}},
-                {"name": "web-app", "namespace": {"full_path": "team/frontend"}},
-                {"name": "api-gateway", "namespace": {"full_path": "team/backend"}},
-                {"name": "api-docs", "namespace": {"full_path": "team/frontend"}},
-            ]
-            
-            filtered = client._filter_projects(projects)
-            
-            # 只有 backend namespace 下包含 api 的项目
-            assert len(filtered) == 2
-            names = [p["name"] for p in filtered]
-            assert "user-api" in names
-            assert "api-gateway" in names
+
+    def test_should_sort_by_total_changes_descending_when_csv_exported(
+        self, gitlab_client, tmp_dir
+    ):
+        collector = CodeStatsCollector(gitlab_client, cache_dir=tmp_dir)
+        stats = collector.collect()
+
+        csv_path = os.path.join(tmp_dir, "stats.csv")
+        StatsExporter.to_csv(stats, csv_path)
+
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+
+        total_changes = []
+        for row in rows[1:]:
+            additions = int(row[2])
+            deletions = int(row[3])
+            total_changes.append(additions + deletions)
+
+        for i in range(1, len(total_changes)):
+            assert total_changes[i - 1] >= total_changes[i]
